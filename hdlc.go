@@ -1,60 +1,24 @@
-// Package hdlc implements an HDLC/SLIP-style framing layer with CRC and retries
-// on top of an unreliable byte stream (e.g. UART).
-//
-// Wire format (after SLIP-style byte stuffing):
-//
-//	FLAG (0x7E)
-//	[stuffed bytes of]
-//	  frameID   : uint16 BE
-//	  length    : uint16 BE
-//	  frameType : uint8  (0=data, 1=ack, 2=nack)
-//	  payload   : length bytes
-//	  crc32     : uint32 BE over (frameID|length|frameType|payload)
-//	FLAG (0x7E)
-//
-// All occurrences of FLAG (0x7E) and ESC (0x7D) in the inner bytes
-// are escaped as: ESC, byte^0x20.
-//
-// The public type HDLCFramer implements:
-//
-//	type Framer interface {
-//	    SetAutoFlush(bool)
-//	    io.ReadWriter
-//	}
-//
-// HDLCFramer also provides a Flush() method when autoFlush is false.
+// hdlc/hdlc.go
 package hdlc
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
-	"hash/crc32"
 	"io"
 	"sync"
 	"time"
+
+	"github.com/sparques/hdlc/internal/arq"
+	"github.com/sparques/hdlc/internal/wire"
 )
 
 const (
-	flagByte = 0x7E
-	escByte  = 0x7D
-	escXor   = 0x20
-
-	frameTypeData = 0x00
-	frameTypeAck  = 0x01
-	frameTypeNack = 0x02
-
 	DefaultMaxPayloadSize = 0xFFFF // uint16 max
-	DefaultRetryInterval  = 200 * time.Millisecond
-	DefaultMaxRetries     = 5
+	DefaultRetryInterval  = arq.DefaultRetryInterval
+	DefaultMaxRetries     = arq.DefaultMaxRetries
 )
 
-// Koopman CRC32 polynomial.
-const koopmanPoly = 0x741B8CD7
-
-var koopmanTable = crc32.MakeTable(koopmanPoly)
-
-// Framer is an interface that wraps io.ReadWriter
+// Framer is the public interface you requested.
 type Framer interface {
 	SetAutoFlush(bool)
 	io.ReadWriter
@@ -85,16 +49,10 @@ func WithMaxRetries(n int) Option {
 }
 
 // HDLCFramer implements Framer on top of an underlying io.ReadWriter.
-//
-// It spawns goroutines internally:
-//   - readLoop: decodes frames, checks CRC, delivers data, handles acks.
-//   - retransmitLoop: resends timed-out frames.
-//
-// It uses stop-and-wait ARQ: only one data frame is outstanding at a time.
+// It uses internal/wire for framing and internal/arq for stop-and-wait ARQ.
 type HDLCFramer struct {
 	rw io.ReadWriter
 
-	// framing / sending
 	maxPayloadSize uint16
 	autoFlush      bool
 
@@ -103,12 +61,10 @@ type HDLCFramer struct {
 
 	wireMu sync.Mutex // serialize writes to underlying rw
 
-	// ARQ
+	// ARQ config & state
 	retryInterval time.Duration
 	maxRetries    int
-
-	sentMu sync.Mutex
-	sent   *sentFrame // single outstanding frame (stop-and-wait)
+	arq           *arq.StopAndWait
 
 	// recv side
 	recvMu     sync.Mutex
@@ -123,19 +79,15 @@ type HDLCFramer struct {
 
 	readErrMu sync.Mutex
 	readErr   error
-
-	// sequence numbers
-	nextIDMu sync.Mutex
-	nextID   uint16
 }
 
-// sentFrame tracks one outstanding data frame waiting for ack.
-type sentFrame struct {
-	id       uint16
-	payload  []byte
-	retries  int
-	lastSent time.Time
-	done     chan error
+// frameSender adapts HDLCFramer to arq.Sender.
+type frameSender struct {
+	f *HDLCFramer
+}
+
+func (s *frameSender) SendFrame(id uint16, t wire.FrameType, payload []byte) error {
+	return s.f.sendFrame(id, t, payload)
 }
 
 // NewFramer wraps an underlying io.ReadWriter with HDLC framing.
@@ -147,6 +99,7 @@ func NewFramer(rw io.ReadWriter, opts ...Option) *HDLCFramer {
 		maxRetries:     DefaultMaxRetries,
 		closed:         make(chan struct{}),
 		pending:        make(map[uint16][]byte),
+		autoFlush:      true,
 	}
 	f.recvCond = sync.NewCond(&f.recvMu)
 
@@ -154,9 +107,9 @@ func NewFramer(rw io.ReadWriter, opts ...Option) *HDLCFramer {
 		o(f)
 	}
 
-	// start background workers
+	f.arq = arq.NewStopAndWait(&frameSender{f: f}, f.retryInterval, f.maxRetries)
+
 	go f.readLoop()
-	go f.retransmitLoop()
 
 	return f
 }
@@ -167,14 +120,12 @@ func NewFramer(rw io.ReadWriter, opts ...Option) *HDLCFramer {
 //     segmented into frames and sent (with retries/acks).
 //
 //   - If autoFlush is false, Write() just buffers into an internal buffer
-//     until Flush() is called or the buffer reaches MaxPayloadSize, at which
-//     point frames are emitted.
+//     until Flush() is called or the buffer reaches MaxPayloadSize.
 func (f *HDLCFramer) SetAutoFlush(b bool) {
 	f.sendBufMu.Lock()
 	defer f.sendBufMu.Unlock()
 
 	if b && !f.autoFlush && f.sendBuf.Len() > 0 {
-		// flush what we have when switching from buffered to autoflush.
 		_ = f.flushLocked()
 	}
 	f.autoFlush = b
@@ -236,7 +187,6 @@ func (f *HDLCFramer) Write(p []byte) (int, error) {
 	}
 
 	if f.autoFlush {
-		// immediate framing
 		offset := 0
 		for offset < len(p) {
 			chunkSize := int(f.maxPayloadSize)
@@ -269,9 +219,11 @@ func (f *HDLCFramer) Write(p []byte) (int, error) {
 }
 
 // Close stops background loops and propagates EOF/errors to readers/writers.
-// Not part of the Framer interface, but handy.
 func (f *HDLCFramer) Close() error {
 	f.closeOnce.Do(func() {
+		if f.arq != nil {
+			f.arq.Close()
+		}
 		close(f.closed)
 		f.setReadErr(io.EOF)
 		f.recvCond.Broadcast()
@@ -280,14 +232,6 @@ func (f *HDLCFramer) Close() error {
 }
 
 // ---------------- internal helpers ----------------
-
-func (f *HDLCFramer) getNextID() uint16 {
-	f.nextIDMu.Lock()
-	defer f.nextIDMu.Unlock()
-	id := f.nextID
-	f.nextID++
-	return id
-}
 
 func (f *HDLCFramer) setReadErr(err error) {
 	if err == nil {
@@ -306,82 +250,39 @@ func (f *HDLCFramer) getReadErr() error {
 	return f.readErr
 }
 
-// sendDataFrame sends one data frame and waits for its ACK (with retries).
 func (f *HDLCFramer) sendDataFrame(payload []byte) error {
-	sf := &sentFrame{
-		id:      f.getNextID(),
-		payload: payload,
-		done:    make(chan error, 1),
-	}
-
-	f.sentMu.Lock()
-	if f.sent != nil {
-		// stop-and-wait: should never happen if we correctly wait on done
-		f.sentMu.Unlock()
-		return errors.New("internal: sendDataFrame called with outstanding frame")
-	}
-	f.sent = sf
-	f.sentMu.Unlock()
-
-	if err := f.sendFrame(sf.id, frameTypeData, sf.payload); err != nil {
-		f.sentMu.Lock()
-		f.sent = nil
-		f.sentMu.Unlock()
-		return err
-	}
-	sf.lastSent = time.Now()
-
-	// wait for ack / error
-	select {
-	case err := <-sf.done:
-		f.sentMu.Lock()
-		f.sent = nil
-		f.sentMu.Unlock()
-		return err
-	case <-f.closed:
-		return io.EOF
-	}
+	_, err := f.arq.Send(payload)
+	return err
 }
 
 // sendFrame encodes and writes one frame to the underlying link.
-func (f *HDLCFramer) sendFrame(id uint16, frameType byte, payload []byte) error {
-	headerLen := 2 + 2 + 1 // id(2) + len(2) + type(1)
+func (f *HDLCFramer) sendFrame(id uint16, t wire.FrameType, payload []byte) error {
 	if len(payload) > int(f.maxPayloadSize) {
 		return errors.New("payload too large")
 	}
-
-	raw := make([]byte, headerLen+len(payload))
-	binary.BigEndian.PutUint16(raw[0:2], id)
-	binary.BigEndian.PutUint16(raw[2:4], uint16(len(payload)))
-	raw[4] = frameType
-	copy(raw[5:], payload)
-
-	crc := crc32.Checksum(raw, koopmanTable)
-	withCRC := make([]byte, len(raw)+4)
-	copy(withCRC, raw)
-	binary.BigEndian.PutUint32(withCRC[len(raw):], crc)
-
-	stuffed := slipStuff(withCRC)
-
-	frame := make([]byte, 0, len(stuffed)+2)
-	frame = append(frame, flagByte)
-	frame = append(frame, stuffed...)
-	frame = append(frame, flagByte)
+	frame := wire.Frame{
+		ID:      id,
+		Type:    t,
+		Payload: payload,
+	}
+	encoded, err := wire.EncodeFrame(frame)
+	if err != nil {
+		return err
+	}
 
 	f.wireMu.Lock()
 	defer f.wireMu.Unlock()
 
-	_, err := f.rw.Write(frame)
+	_, err = f.rw.Write(encoded)
 	return err
 }
 
-// sendAck/Nack do not participate in ARQ themselves.
 func (f *HDLCFramer) sendAck(id uint16) {
-	_ = f.sendFrame(id, frameTypeAck, nil)
+	_ = f.sendFrame(id, wire.FrameTypeAck, nil)
 }
 
 func (f *HDLCFramer) sendNack(id uint16) {
-	_ = f.sendFrame(id, frameTypeNack, nil)
+	_ = f.sendFrame(id, wire.FrameTypeNack, nil)
 }
 
 // readLoop continuously reads frames from the underlying link.
@@ -393,86 +294,51 @@ func (f *HDLCFramer) readLoop() {
 		default:
 		}
 
-		data, err := f.readOneFrame()
+		raw, err := wire.ReadFrame(f.rw)
 		if err != nil {
 			f.setReadErr(err)
-			f.recvCond.Broadcast()
+			_ = f.Close()
 			return
 		}
-		if len(data) == 0 {
+		if len(raw) == 0 {
 			continue
 		}
-		id, payload, frameType, crcOK, err := parseFrame(data)
+
+		frame, crcOK, err := wire.ParseFrame(raw)
 		if err != nil {
 			// malformed, drop
 			continue
 		}
 		if !crcOK {
-			// Bad CRC. We drop and rely on timeout; optional NACK:
-			f.sendNack(id)
+			// drop corrupted; rely on timeout-based retry. Optional NACK:
+			f.sendNack(frame.ID)
 			continue
 		}
 
-		switch frameType {
-		case frameTypeData:
-			f.handleDataFrame(id, payload)
-			f.sendAck(id)
-		case frameTypeAck:
-			f.handleAck(id, false)
-		case frameTypeNack:
-			f.handleAck(id, true)
-		}
-	}
-}
-
-// retransmitLoop periodically checks the outstanding frame and resends on timeout.
-func (f *HDLCFramer) retransmitLoop() {
-	ticker := time.NewTicker(f.retryInterval / 2)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-f.closed:
-			return
-		case <-ticker.C:
-		}
-
-		f.sentMu.Lock()
-		sf := f.sent
-		f.sentMu.Unlock()
-		if sf == nil {
-			continue
-		}
-
-		if time.Since(sf.lastSent) >= f.retryInterval {
-			if sf.retries >= f.maxRetries {
-				sf.done <- errors.New("max retries exceeded")
-				// clearing f.sent is done in sendDataFrame after done
-				continue
-			}
-			sf.retries++
-			sf.lastSent = time.Now()
-			_ = f.sendFrame(sf.id, frameTypeData, sf.payload)
+		switch frame.Type {
+		case wire.FrameTypeData:
+			f.handleDataFrame(frame.ID, frame.Payload)
+			f.sendAck(frame.ID)
+		case wire.FrameTypeAck:
+			f.arq.HandleAck(frame.ID, false)
+		case wire.FrameTypeNack:
+			f.arq.HandleAck(frame.ID, true)
 		}
 	}
 }
 
 // handleDataFrame delivers ordered data to recvBuf and buffers out-of-order frames.
-// (With stop-and-wait we should not see out-of-order,
-// but this makes it easy to extend to sliding windows later.)
 func (f *HDLCFramer) handleDataFrame(id uint16, payload []byte) {
 	f.recvMu.Lock()
 	defer f.recvMu.Unlock()
 
-	// duplicate or old frame
 	if id < f.expectedID {
-		return
+		return // duplicate/old
 	}
 
 	if id == f.expectedID {
 		f.recvBuf.Write(payload)
 		f.expectedID++
-		// flush any buffered successors
 		for {
 			p, ok := f.pending[f.expectedID]
 			if !ok {
@@ -490,129 +356,4 @@ func (f *HDLCFramer) handleDataFrame(id uint16, payload []byte) {
 	cp := make([]byte, len(payload))
 	copy(cp, payload)
 	f.pending[id] = cp
-}
-
-// handleAck processes ACK/NACK for the outstanding frame.
-func (f *HDLCFramer) handleAck(id uint16, isNack bool) {
-	f.sentMu.Lock()
-	sf := f.sent
-	f.sentMu.Unlock()
-
-	if sf == nil || sf.id != id {
-		return
-	}
-
-	if isNack {
-		// Treat NACK as immediate timeout; retransmit or fail.
-		if sf.retries >= f.maxRetries {
-			sf.done <- errors.New("max retries exceeded (nack)")
-		} else {
-			sf.retries++
-			sf.lastSent = time.Now()
-			_ = f.sendFrame(sf.id, frameTypeData, sf.payload)
-		}
-		return
-	}
-
-	// ACK
-	sf.done <- nil
-}
-
-// readOneFrame reads until a full frame (FLAG..FLAG) is obtained and un-stuffed.
-func (f *HDLCFramer) readOneFrame() ([]byte, error) {
-	var buf []byte
-	inFrame := false
-	tmp := []byte{0}
-
-	for {
-		n, err := f.rw.Read(tmp)
-		if err != nil {
-			return nil, err
-		}
-		if n == 0 {
-			continue
-		}
-		b := tmp[0]
-
-		if !inFrame {
-			if b == flagByte {
-				inFrame = true
-				buf = buf[:0]
-			}
-			continue
-		}
-
-		if b == flagByte {
-			// end of frame
-			if len(buf) == 0 {
-				// empty frame, ignore and resync
-				inFrame = false
-				continue
-			}
-			return slipUnstuff(buf)
-		}
-
-		buf = append(buf, b)
-	}
-}
-
-// parseFrame splits an unstuffed frame into header, payload, and CRC.
-func parseFrame(data []byte) (id uint16, payload []byte, frameType byte, crcOK bool, err error) {
-	if len(data) < 2+2+1+4 {
-		err = errors.New("frame too short")
-		return
-	}
-	id = binary.BigEndian.Uint16(data[0:2])
-	length := binary.BigEndian.Uint16(data[2:4])
-	frameType = data[4]
-
-	headerAndPayloadLen := 2 + 2 + 1 + int(length) // 5+len
-	if len(data) < headerAndPayloadLen+4 {
-		err = errors.New("incomplete frame")
-		return
-	}
-
-	headerAndPayload := data[:headerAndPayloadLen]
-	crcBytes := data[headerAndPayloadLen : headerAndPayloadLen+4]
-	expectedCRC := binary.BigEndian.Uint32(crcBytes)
-	actualCRC := crc32.Checksum(headerAndPayload, koopmanTable)
-	crcOK = (expectedCRC == actualCRC)
-
-	payload = headerAndPayload[5:]
-	return
-}
-
-// slipStuff performs SLIP-style escaping on a byte slice.
-func slipStuff(in []byte) []byte {
-	out := make([]byte, 0, len(in))
-	for _, b := range in {
-		if b == flagByte || b == escByte {
-			out = append(out, escByte, b^escXor)
-		} else {
-			out = append(out, b)
-		}
-	}
-	return out
-}
-
-// slipUnstuff reverses slipStuff.
-func slipUnstuff(in []byte) ([]byte, error) {
-	out := make([]byte, 0, len(in))
-	esc := false
-	for _, b := range in {
-		if esc {
-			out = append(out, b^escXor)
-			esc = false
-			continue
-		}
-		if b == escByte {
-			esc = true
-			continue
-		}
-		out = append(out, b)
-	}
-	if esc {
-		return nil, errors.New("trailing escape byte")
-	}
-	return out, nil
 }
