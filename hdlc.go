@@ -336,9 +336,9 @@ func (f *HDLCFramer) handleDataFrame(id uint16, payload []byte) {
 		return // duplicate/old
 	}
 
-	if id == f.expectedID {
+	if id >= f.expectedID {
 		f.recvBuf.Write(payload)
-		f.expectedID++
+		f.expectedID = id + 1
 		for {
 			p, ok := f.pending[f.expectedID]
 			if !ok {
